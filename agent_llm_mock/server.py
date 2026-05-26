@@ -1,15 +1,38 @@
 """Mock LLM server — OpenAI-compatible endpoint with web dashboard for manual response control."""
 
+import asyncio
 import json
+import logging
+import sys
 import time
 import uuid
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 import uvicorn
+
+# ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger("agent-llm-mock")
+logger.setLevel(logging.DEBUG)
+
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setLevel(logging.DEBUG)
+_console_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(levelname)-7s %(message)s",
+    datefmt="%H:%M:%S",
+))
+logger.addHandler(_console_handler)
+
+# Keep noisy lib logs at WARNING, uvicorn.access at INFO for audit trail
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+logging.getLogger("fastapi").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +150,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <title>LLM Mock Dashboard</title>
 <style>
   :root { --bg: #1a1a2e; --card: #16213e; --text: #e0e0e0; --accent: #0f3460;
-          --green: #4caf50; --orange: #ff9800; --red: #f44336; --blue: #2196f3; }
+          --green: #4caf50; --orange: #ff9800; --red: #f44336; --blue: #2196f3;
+          --purple: #7c3aed; --border: #2a2a4a; --input-bg: #0d0d1a; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
   .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
@@ -138,39 +162,66 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .stat.pending .num { color: var(--orange); }
   .stat.completed .num { color: var(--green); }
   .req-list { display: flex; flex-direction: column; gap: 12px; }
-  .req-card { background: var(--card); border-radius: 10px; padding: 14px; cursor: pointer; transition: border 0.15s; }
-  .req-card:hover { border: 1px solid var(--accent); }
-  .req-card.selected { border: 2px solid var(--blue); }
-  .req-card .meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-  .req-card .model { font-size: 0.85rem; color: #888; }
-  .req-card .time { font-size: 0.8rem; color: #666; }
-  .req-card .preview { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90vw; }
-  .req-card .badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
+  .req-card { background: var(--card); border-radius: 10px; overflow: hidden; transition: border 0.15s; }
+  .req-card.expanded { border: 2px solid var(--blue); }
+  .req-card-header { padding: 14px; cursor: pointer; user-select: none; }
+  .req-card-header:hover { background: #1a2550; }
+  .req-card-header .meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .req-card-header .model { font-size: 0.85rem; color: #888; }
+  .req-card-header .time { font-size: 0.8rem; color: #666; }
+  .req-card-header .preview { font-size: 0.9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90vw; }
+  .req-card-header .badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
+  .req-card-header .expand-icon { color: #666; margin-left: 8px; font-size: 0.7rem; transition: transform 0.2s; display: inline-block; }
+  .req-card.expanded .expand-icon { transform: rotate(180deg); }
   .badge.pending { background: var(--orange); color: #000; }
   .badge.completed { background: var(--green); color: #000; }
   .badge.skipped { background: #666; color: #fff; }
-  .detail-panel { background: var(--card); border-radius: 10px; padding: 16px; margin-top: 16px; display: none; }
-  .detail-panel.active { display: block; }
-  .section-title { font-size: 1rem; font-weight: bold; margin: 12px 0 6px; color: #aaa; }
-  .raw-json { background: #0d0d1a; border-radius: 6px; padding: 12px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; max-height: 400px; overflow-y: auto; }
-  .tools-json { background: #0d0d1a; border-radius: 6px; padding: 12px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.78rem; white-space: pre-wrap; max-height: 250px; overflow-y: auto; }
-  .response-area { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
-  .response-area textarea { width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #444; background: #0d0d1a; color: #e0e0e0; font-family: inherit; font-size: 0.9rem; resize: vertical; min-height: 80px; }
-  .response-area textarea.tools-input { min-height: 100px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.8rem; }
-  .btn-row { display: flex; gap: 8px; }
+  .req-card-detail { display: none; padding: 0 16px 16px; border-top: 1px solid var(--border); }
+  .req-card.expanded .req-card-detail { display: block; }
+  .section-title { font-size: 1rem; font-weight: bold; margin: 14px 0 6px; color: #aaa; }
+  .raw-json { background: var(--input-bg); border-radius: 6px; padding: 12px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow-y: auto; border: 1px solid var(--border); }
+  .detail-response-text { width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #444; background: var(--input-bg); color: var(--text); font-family: inherit; font-size: 0.9rem; resize: vertical; min-height: 80px; display: block; }
+  .btn-row { display: flex; gap: 8px; margin-top: 16px; }
   .btn { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: opacity 0.15s; }
   .btn:hover { opacity: 0.85; }
   .btn-submit { background: var(--green); color: #fff; }
   .btn-skip { background: var(--red); color: #fff; }
-  .btn-tools-toggle { background: transparent; border: 1px solid #555; color: #aaa; font-size: 0.8rem; padding: 4px 12px; }
-  .tools-section { display: none; margin-top: 8px; }
-  .tools-section.visible { display: flex; flex-direction: column; gap: 6px; }
-  .tools-hint { font-size: 0.75rem; color: #888; }
   .empty-state { text-align: center; padding: 40px; color: #666; }
   .empty-state .icon { font-size: 2rem; }
+
+  /* Tool mock module */
+  .tool-module { background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+  .tool-module-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: #0f0f23; cursor: pointer; user-select: none; }
+  .tool-module-header:hover { background: #141430; }
+  .tool-module-header .tool-name { font-weight: 600; color: var(--purple); font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.9rem; }
+  .tool-module-header .collapse-icon { color: #888; transition: transform 0.2s; font-size: 0.7rem; }
+  .tool-module.collapsed .collapse-icon { transform: rotate(-90deg); }
+  .tool-module-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .tool-module.collapsed .tool-module-body { display: none; }
+  .tool-enable-row { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+  .tool-enable-row input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--green); cursor: pointer; }
+  .tool-enable-row label { font-size: 0.85rem; color: #ccc; cursor: pointer; }
+  .field-row { display: flex; align-items: center; gap: 10px; }
+  .field-row label { min-width: 100px; font-size: 0.82rem; color: #888; text-align: right; }
+  .field-row label.required::after { content: ' *'; color: var(--red); }
+  .field-row input, .field-row select, .field-row textarea { flex: 1; padding: 6px 10px; border-radius: 4px; border: 1px solid #444; background: #0a0a18; color: var(--text); font-family: inherit; font-size: 0.85rem; }
+  .field-row input:focus, .field-row select:focus, .field-row textarea:focus { outline: none; border-color: var(--blue); }
+  .field-row textarea { font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.78rem; min-height: 50px; resize: vertical; }
+  .field-row select { cursor: pointer; }
+  .call-id-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .call-id-row input { flex: 1; padding: 5px 8px; border-radius: 4px; border: 1px solid #444; background: #0a0a18; color: #888; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.78rem; }
+  .call-id-row button { padding: 4px 10px; font-size: 0.75rem; background: #2a2a4a; color: #aaa; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
+  .call-id-row button:hover { background: #3a3a5a; }
+
+  /* JSON preview */
+  .preview-box { background: #0a0a18; border: 1px solid #333; border-radius: 6px; padding: 12px; font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.78rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto; color: #8be9fd; }
+  .tools-empty { font-size: 0.85rem; color: #666; padding: 8px 0; }
+
   @media (max-width: 768px) {
     body { padding: 10px; }
-    .req-card .preview { max-width: 70vw; }
+    .req-card-header .preview { max-width: 70vw; }
+    .field-row { flex-direction: column; align-items: flex-start; gap: 4px; }
+    .field-row label { text-align: left; }
   }
 </style>
 </head>
@@ -192,34 +243,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div class="detail-panel" id="detailPanel">
-  <div class="section-title">Request Detail</div>
-  <div class="raw-json" id="detailJson"></div>
-  <div class="section-title">Tools</div>
-  <div class="tools-json" id="toolsJson">(none)</div>
-  <div class="response-area">
-    <label for="responseText" style="font-weight:600;">Response (plain text)</label>
-    <textarea id="responseText" placeholder="Type assistant response here..."></textarea>
-    <button class="btn-tools-toggle" onclick="toggleTools()">+ Tool Calls (advanced)</button>
-    <div class="tools-section" id="toolsSection">
-      <label for="toolsInput" style="font-weight:600;">Tool Calls (JSON array)</label>
-      <textarea class="tools-input" id="toolsInput" placeholder='[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/x\"}"}}]'></textarea>
-      <span class="tools-hint">Leave empty if no tool calls. Paste valid JSON array matching OpenAI tool_calls format.</span>
-    </div>
-    <div class="btn-row">
-      <button class="btn btn-submit" onclick="submitResponse()">Submit Response</button>
-      <button class="btn btn-skip" onclick="skipRequest()">Skip (empty response)</button>
-    </div>
-  </div>
-</div>
-
 <script>
-let selectedId = null;
-let currentPort = location.port || '9999';
+let expandedId = null;
+let requestCache = {};
+let ws = null;
 
-function toggleTools() {
-  document.getElementById('toolsSection').classList.toggle('visible');
-}
+function genCallId() { return 'call_' + crypto.randomUUID().replace(/-/g,'').substring(0,12); }
+
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -227,85 +258,330 @@ async function fetchJSON(url) {
   return r.json();
 }
 
-async function poll() {
-  try {
-    const data = await fetchJSON('/api/requests');
-    renderList(data.requests);
-    document.getElementById('pendingCount').textContent = data.pending;
-    document.getElementById('completedCount').textContent = data.completed;
-  } catch(e) { console.error(e); }
+// ---- WebSocket ----
+function connectWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  ws.onmessage = function(e) {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'init') handleInit(msg);
+    else if (msg.type === 'new_request') handleNewRequest(msg);
+    else if (msg.type === 'request_updated') handleRequestUpdated(msg);
+  };
+  ws.onclose = function() { setTimeout(connectWs, 2000); };
+  ws.onerror = function() { ws.close(); };
 }
 
-function renderList(requests) {
-  const el = document.getElementById('reqList');
+function handleInit(msg) {
+  requestCache = {};
+  (msg.requests || []).forEach(function(r){ requestCache[r.id] = r; });
+  document.getElementById('pendingCount').textContent = msg.pending || 0;
+  document.getElementById('completedCount').textContent = msg.completed || 0;
+  buildAllCards(msg.requests || []);
+}
+
+function buildAllCards(requests) {
+  var el = document.getElementById('reqList');
   if (!requests || requests.length === 0) {
-    el.innerHTML = '<div class="empty-state"><div class="icon">&#128179;</div><p>Waiting for requests...</p></div>';
+    el.innerHTML = '<div class="empty-state"><div class="icon">&#128179;</div><p>Waiting for requests...</p><p style=\"font-size:0.8rem;margin-top:4px;\">Point your agent\'s base_url to http://HOST:PORT/v1</p></div>';
     return;
   }
-  el.innerHTML = requests.map(r => {
-    const lastUser = (r.messages || []).filter(m => m.role === 'user').pop();
-    const preview = lastUser ? (lastUser.content || '').substring(0, 100) : '(system prompt)';
-    const toolCount = r.tools ? r.tools.length : 0;
-    const badges = toolCount > 0 ? `<span style="color:#888;font-size:0.75rem;">+${toolCount} tools</span>` : '';
-    const sel = r.id === selectedId ? ' selected' : '';
-    return `<div class="req-card${sel}" onclick="selectRequest('${r.id}')">
-      <div class="meta">
-        <span class="model">${esc(r.model)} ${badges}</span>
-        <span class="time">${new Date(r.created_at * 1000).toLocaleTimeString()}</span>
-      </div>
-      <div class="preview">${esc(preview)}</div>
-      <span class="badge ${r.status}">${r.status}</span>
-    </div>`;
-  }).join('');
+  var html = '';
+  requests.forEach(function(r) {
+    html += buildCardHTML(r);
+  });
+  el.innerHTML = html;
 }
 
-function esc(s) { return (s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function buildCardHTML(r) {
+  var isExpanded = r.id === expandedId;
+  return '<div class="req-card'+(isExpanded?' expanded':'')+'" id="card-'+r.id+'">'
+    + buildCardHeaderHTML(r)
+    + '<div class="req-card-detail" id="detail-'+r.id+'">'
+    + (isExpanded ? buildDetailHTML(r) : '')
+    + '</div></div>';
+}
 
-async function selectRequest(id) {
-  selectedId = id;
-  try {
-    const r = await fetchJSON('/api/requests/' + id);
-    document.getElementById('detailPanel').classList.add('active');
-    document.getElementById('detailJson').textContent = JSON.stringify({
+function buildCardHeaderHTML(r) {
+  var lastUser = (r.messages || []).filter(function(m){ return m.role === 'user'; }).pop();
+  var preview = lastUser ? (lastUser.content || '').substring(0, 100) : '(system prompt)';
+  var toolCount = r.tools ? r.tools.length : 0;
+  var badges = toolCount > 0 ? '<span style=\"color:#888;font-size:0.75rem;\">+'+toolCount+' tools</span>' : '';
+  return '<div class=\"req-card-header\" onclick=\"toggleRequest(\''+r.id+'\')\">'
+    +'<div class=\"meta\"><span class=\"model\">'+esc(r.model)+' '+badges+'</span>'
+    +'<span class=\"time\">'+new Date(r.created_at*1000).toLocaleTimeString()
+    +' <span class=\"expand-icon\">&#9660;</span></span></div>'
+    +'<div class=\"preview\">'+esc(preview)+'</div>'
+    +'<span class=\"badge '+r.status+'\">'+r.status+'</span>'
+    +'</div>';
+}
+
+function handleNewRequest(msg) {
+  requestCache[msg.request.id] = msg.request;
+  document.getElementById('pendingCount').textContent = msg.pending || 0;
+  document.getElementById('completedCount').textContent = msg.completed || 0;
+  var el = document.getElementById('reqList');
+  var emptyState = el.querySelector('.empty-state');
+  if (emptyState) emptyState.remove();
+  var card = document.createElement('div');
+  card.className = 'req-card';
+  card.id = 'card-' + msg.request.id;
+  card.innerHTML = buildCardHeaderHTML(msg.request)
+    + '<div class=\"req-card-detail\" id=\"detail-'+msg.request.id+'\"></div>';
+  el.insertBefore(card, el.firstChild);
+}
+
+function handleRequestUpdated(msg) {
+  requestCache[msg.request.id] = msg.request;
+  document.getElementById('pendingCount').textContent = msg.pending || 0;
+  document.getElementById('completedCount').textContent = msg.completed || 0;
+  var card = document.getElementById('card-'+msg.request.id);
+  if (!card) return;
+  var badge = card.querySelector('.badge');
+  if (badge) {
+    badge.textContent = msg.request.status;
+    badge.className = 'badge ' + msg.request.status;
+  }
+  // If expanded and now non-pending, hide action buttons
+  if (msg.request.id === expandedId && msg.request.status !== 'pending') {
+    var detail = document.getElementById('detail-'+msg.request.id);
+    if (detail) {
+      var btnRow = detail.querySelector('.btn-row');
+      if (btnRow) btnRow.style.display = 'none';
+    }
+  }
+}
+
+// ---- Detail HTML builder ----
+function buildDetailHTML(r) {
+  var tools = r.tools || [];
+  var existingTC = r.response_tool_calls || [];
+  var existingByName = {};
+  existingTC.forEach(function(tc) {
+    if (tc.function && tc.function.name) existingByName[tc.function.name] = tc;
+  });
+
+  var toolsHTML = '';
+  if (tools.length === 0) {
+    toolsHTML = '<div class=\"tools-empty\">(no tools in this request)</div>';
+  } else {
+    toolsHTML = '<div class=\"section-title\">Tool Call Mocks ('+tools.length+' tool'+(tools.length>1?'s':'')+')</div>';
+    tools.forEach(function(tool, idx) {
+      var fn = tool.function || {};
+      var name = fn.name || 'unknown_tool_'+idx;
+      var params = fn.parameters || {};
+      var props = params.properties || {};
+      var required = params.required || [];
+      var existing = existingByName[name] || {};
+      var wasEnabled = !!existing.id;
+
+      var callId = existing.id || genCallId();
+      var existingArgs = {};
+      if (existing.function && existing.function.arguments) {
+        try { existingArgs = JSON.parse(existing.function.arguments); } catch(e) {}
+      }
+
+      var fieldsHTML = Object.keys(props).map(function(propName) {
+        var prop = props[propName] || {};
+        var isReq = required.indexOf(propName) >= 0;
+        var val = existingArgs[propName] !== undefined ? existingArgs[propName] : (prop.default !== undefined ? prop.default : '');
+        var desc = prop.description ? ' title=\"'+esc(prop.description)+'\"' : '';
+
+        if (prop.enum && Array.isArray(prop.enum)) {
+          var opts = (isReq ? '' : '<option value=\"\">-- not set --</option>');
+          prop.enum.forEach(function(v) {
+            opts += '<option value=\"'+esc(String(v))+'\"'+(String(val)===String(v)?' selected':'')+'>'+esc(String(v))+'</option>';
+          });
+          return '<div class=\"field-row\"><label class=\"'+(isReq?'required':'')+'\"'+desc+'>'+esc(propName)+'</label>'
+            +'<select data-field=\"'+esc(propName)+'\" data-type=\"enum\">'+opts+'</select></div>';
+        }
+        if (prop.type === 'boolean') {
+          var bopts = '<option value=\"\">-- not set --</option>';
+          ['true','false'].forEach(function(v) { bopts += '<option value=\"'+v+'\"'+(String(val)===v?' selected':'')+'>'+v+'</option>'; });
+          return '<div class=\"field-row\"><label class=\"'+(isReq?'required':'')+'\"'+desc+'>'+esc(propName)+'</label>'
+            +'<select data-field=\"'+esc(propName)+'\" data-type=\"boolean\">'+bopts+'</select></div>';
+        }
+        if (prop.type === 'number' || prop.type === 'integer') {
+          return '<div class=\"field-row\"><label class=\"'+(isReq?'required':'')+'\"'+desc+'>'+esc(propName)+'</label>'
+            +'<input type=\"number\" data-field=\"'+esc(propName)+'\" data-type=\"'+prop.type+'\" value=\"'+esc(String(val))+'\"'
+            +(prop.minimum!==undefined?' min=\"'+prop.minimum+'\"':'')+(prop.maximum!==undefined?' max=\"'+prop.maximum+'\"':'')+' /></div>';
+        }
+        if (prop.type === 'array' || prop.type === 'object') {
+          var jsonVal = typeof val === 'object' ? JSON.stringify(val) : String(val);
+          return '<div class=\"field-row\"><label class=\"'+(isReq?'required':'')+'\"'+desc+'>'+esc(propName)+'</label>'
+            +'<textarea data-field=\"'+esc(propName)+'\" data-type=\"'+prop.type+'\" rows=\"2\">'+esc(jsonVal)+'</textarea></div>';
+        }
+        return '<div class=\"field-row\"><label class=\"'+(isReq?'required':'')+'\"'+desc+'>'+esc(propName)+'</label>'
+          +'<input type=\"text\" data-field=\"'+esc(propName)+'\" data-type=\"'+(prop.type||'string')+'\" value=\"'+esc(String(val))+'\" /></div>';
+      }).join('');
+
+      if (!fieldsHTML) {
+        fieldsHTML = '<div style=\"color:#666;font-size:0.8rem;\">(no parameters defined)</div>';
+      }
+
+      toolsHTML += '<div class=\"tool-module'+(wasEnabled?'':' collapsed')+'\" id=\"toolMod-'+r.id+'-'+idx+'\">'
+        +'<div class=\"tool-module-header\" onclick=\"event.stopPropagation();document.getElementById(\'toolMod-'+r.id+'-'+idx+'\').classList.toggle(\'collapsed\')\">'
+        +'<span class=\"tool-name\">'+esc(name)+'</span>'
+        +'<span style=\"font-size:0.78rem;color:#666;\">params: '+Object.keys(props).length+'</span>'
+        +'<span class=\"collapse-icon\">&#9660;</span></div>'
+        +'<div class=\"tool-module-body\">'
+        +'<div class=\"tool-enable-row\">'
+        +'<input type=\"checkbox\" id=\"enable-'+r.id+'-'+idx+'\" '+(wasEnabled?'checked':'')+' onchange=\"onToolToggle(\''+r.id+'\')\">'
+        +'<label for=\"enable-'+r.id+'-'+idx+'\">Include this tool call in response</label></div>'
+        +'<div class=\"call-id-row\"><span style=\"font-size:0.78rem;color:#888;\">call_id:</span>'
+        +'<input type=\"text\" id=\"callId-'+r.id+'-'+idx+'\" value=\"'+esc(callId)+'\" />'
+        +'<button onclick=\"event.stopPropagation();document.getElementById(\'callId-'+r.id+'-'+idx+'\').value=genCallId()\">Regen</button></div>'
+        +fieldsHTML
+        +'</div></div>';
+    });
+
+    toolsHTML += '<div id=\"preview-'+r.id+'\" style=\"display:none;\">'
+      +'<div class=\"section-title\">Assembled tool_calls (JSON preview)</div>'
+      +'<div class=\"preview-box\" id=\"previewContent-'+r.id+'\"></div></div>';
+  }
+
+  var buttonsHTML = '';
+  if (r.status === 'pending') {
+    buttonsHTML = '<div class=\"btn-row\">'
+      +'<button class=\"btn btn-submit\" onclick=\"submitResponse(\''+r.id+'\')\">Submit Response</button>'
+      +'<button class=\"btn btn-skip\" onclick=\"skipRequest(\''+r.id+'\')\">Skip (empty response)</button>'
+      +'</div>';
+  } else {
+    buttonsHTML = '<div style=\"margin-top:12px;color:#666;font-size:0.85rem;\">Request already '+esc(r.status)+' &mdash; no further action needed.</div>';
+  }
+
+  return '<div class=\"section-title\">Request Detail</div>'
+    +'<div class=\"raw-json\">'+esc(JSON.stringify({
       model: r.model, messages: r.messages, temperature: r.temperature,
       max_tokens: r.max_tokens, stream: r.stream, tools: r.tools,
       response_format: r.response_format, extra_body: r.extra_body,
-    }, null, 2);
-    document.getElementById('toolsJson').textContent = r.tools ? JSON.stringify(r.tools, null, 2) : '(none)';
-    document.getElementById('responseText').value = r.response_content || '';
-    document.getElementById('toolsInput').value = r.response_tool_calls ? JSON.stringify(r.response_tool_calls, null, 2) : '';
-  } catch(e) { console.error(e); }
-  poll();
+    }, null, 2))+'</div>'
+    +'<div class=\"section-title\">Response Text</div>'
+    +'<textarea class=\"detail-response-text\" id=\"respText-'+r.id+'\" placeholder=\"Type assistant text response here...\">'+esc(r.response_content||'')+'</textarea>'
+    +toolsHTML
+    +buttonsHTML;
 }
 
-async function submitResponse() {
-  if (!selectedId) return alert('Select a request first');
-  const content = document.getElementById('responseText').value;
-  let tool_calls = null;
-  const tcText = document.getElementById('toolsInput').value.trim();
-  if (tcText) {
-    try { tool_calls = JSON.parse(tcText); } catch(e) { return alert('Invalid tool_calls JSON: ' + e.message); }
+// ---- Expand / collapse ----
+async function toggleRequest(id) {
+  if (expandedId === id) {
+    // Collapse — keep detail HTML so re-expand preserves form state
+    document.getElementById('card-'+id).classList.remove('expanded');
+    expandedId = null;
+    return;
   }
-  await fetch('/api/requests/' + selectedId + '/respond', {
+  // Collapse previous (keep its detail HTML)
+  if (expandedId) {
+    var prevCard = document.getElementById('card-'+expandedId);
+    if (prevCard) prevCard.classList.remove('expanded');
+  }
+  // Expand this one
+  expandedId = id;
+  document.getElementById('card-'+id).classList.add('expanded');
+  var detailEl = document.getElementById('detail-'+id);
+  // Only rebuild if empty; otherwise user was already editing
+  if (!detailEl.innerHTML.trim()) {
+    var r = requestCache[id];
+    if (!r) {
+      r = await fetchJSON('/api/requests/' + id);
+      requestCache[id] = r;
+    }
+    detailEl.innerHTML = buildDetailHTML(r);
+    refreshPreview(id);
+  } else {
+    // Detail already built — just refresh preview
+    refreshPreview(id);
+  }
+}
+
+// ---- Tool enable toggle ----
+function onToolToggle(reqId) {
+  refreshPreview(reqId);
+}
+
+// Debounce preview refresh on input
+document.addEventListener('input', function(e) {
+  var detailEl = e.target.closest('.req-card-detail');
+  if (detailEl) {
+    var reqId = detailEl.id.replace('detail-','');
+    clearTimeout(window._previewTimer);
+    window._previewTimer = setTimeout(function(){ refreshPreview(reqId); }, 300);
+  }
+});
+
+// ---- Collect & preview tool_calls ----
+function collectToolCalls(reqId) {
+  var r = requestCache[reqId];
+  if (!r || !r.tools || r.tools.length === 0) return null;
+  var result = [];
+  r.tools.forEach(function(tool, idx) {
+    var cb = document.getElementById('enable-'+reqId+'-'+idx);
+    if (!cb || !cb.checked) return;
+    var fn = tool.function || {};
+    var name = fn.name || 'unknown_tool_'+idx;
+    var callIdEl = document.getElementById('callId-'+reqId+'-'+idx);
+    var callId = callIdEl ? callIdEl.value : genCallId();
+    var args = {};
+    var detailEl = document.getElementById('detail-'+reqId);
+    if (detailEl) {
+      var inputs = detailEl.querySelectorAll('[data-field]');
+      inputs.forEach(function(inp) {
+        var mod = inp.closest('.tool-module');
+        if (!mod) return;
+        if (mod.id !== 'toolMod-'+reqId+'-'+idx) return;
+        var field = inp.dataset.field;
+        var val = inp.value;
+        if (val === '' || val === null || val === undefined) return;
+        var dtype = inp.dataset.type;
+        if (dtype === 'number' || dtype === 'integer') {
+          val = dtype === 'integer' ? parseInt(val,10) : parseFloat(val);
+          if (isNaN(val)) return;
+        } else if (dtype === 'boolean') {
+          val = val === 'true';
+        } else if (dtype === 'array' || dtype === 'object') {
+          try { val = JSON.parse(val); } catch(e) {}
+        }
+        args[field] = val;
+      });
+    }
+    result.push({
+      id: callId,
+      type: 'function',
+      function: { name: name, arguments: JSON.stringify(args) }
+    });
+  });
+  return result.length > 0 ? result : null;
+}
+
+function refreshPreview(reqId) {
+  var previewDiv = document.getElementById('preview-'+reqId);
+  var previewContent = document.getElementById('previewContent-'+reqId);
+  if (!previewDiv || !previewContent) return;
+  var tc = collectToolCalls(reqId);
+  if (tc && tc.length > 0) {
+    previewDiv.style.display = 'block';
+    previewContent.textContent = JSON.stringify(tc, null, 2);
+  } else {
+    previewDiv.style.display = 'none';
+  }
+}
+
+// ---- Submit / Skip ----
+async function submitResponse(reqId) {
+  var content = document.getElementById('respText-'+reqId).value;
+  var tool_calls = collectToolCalls(reqId);
+  await fetch('/api/requests/' + reqId + '/respond', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({content: content, tool_calls: tool_calls}),
   });
-  document.getElementById('detailPanel').classList.remove('active');
-  selectedId = null;
-  poll();
 }
 
-async function skipRequest() {
-  if (!selectedId) return;
-  await fetch('/api/requests/' + selectedId + '/skip', {method: 'POST'});
-  document.getElementById('detailPanel').classList.remove('active');
-  selectedId = null;
-  poll();
+async function skipRequest(reqId) {
+  await fetch('/api/requests/' + reqId + '/skip', {method: 'POST'});
 }
 
-setInterval(poll, 2000);
-poll();
+connectWs();
 </script>
 </body>
 </html>"""
@@ -325,6 +601,7 @@ class MockLLMServer:
         self._lock = threading.Lock()
         self._scripts = _load_scripts(scripts_path)
         self._server_thread: Optional[threading.Thread] = None
+        self._ws_clients: set = set()
         self._app = self._create_app()
 
     # ---- public API ----
@@ -338,12 +615,12 @@ class MockLLMServer:
         if self._scripts:
             print(f"  Scripts loaded: {len(self._scripts)} patterns")
         print()
-        uvicorn.run(self._app, host=self.host, port=self.port, log_level="warning")
+        uvicorn.run(self._app, host=self.host, port=self.port, log_level="info")
 
     def start_in_thread(self) -> threading.Thread:
         """Start the server in a background thread. Returns the thread."""
         def _run():
-            uvicorn.run(self._app, host=self.host, port=self.port, log_level="warning")
+            uvicorn.run(self._app, host=self.host, port=self.port, log_level="info")
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         self._server_thread = t
@@ -362,6 +639,35 @@ class MockLLMServer:
         with self._lock:
             return [r for r in self._pending.values() if r.status == "pending"]
 
+    def _serialize(self, req: PendingRequest) -> dict:
+        return {
+            "id": req.id, "model": req.model, "messages": req.messages,
+            "tools": req.tools, "temperature": req.temperature,
+            "max_tokens": req.max_tokens, "stream": req.stream,
+            "status": req.status, "created_at": req.created_at,
+            "response_content": req.response_content,
+            "response_tool_calls": req.response_tool_calls,
+            "response_format": req.response_format,
+            "extra_body": req.extra_body,
+        }
+
+    async def _broadcast(self, msg: dict):
+        dead = set()
+        for ws in self._ws_clients:
+            try:
+                await ws.send_json(msg)
+            except Exception:
+                dead.add(ws)
+        self._ws_clients -= dead
+
+    def _stats(self):
+        with self._lock:
+            items = list(self._pending.values())
+        return {
+            "pending": sum(1 for r in items if r.status == "pending"),
+            "completed": sum(1 for r in items if r.status != "pending"),
+        }
+
     # ---- internals ----
 
     def _create_app(self) -> FastAPI:
@@ -372,16 +678,39 @@ class MockLLMServer:
             body = await request.json()
 
             req_id = uuid.uuid4().hex[:16]
+            model = body.get("model", "unknown")
+            messages = body.get("messages", [])
+            tools = body.get("tools")
+            stream = body.get("stream", False)
+            extra = body.get("extra_body")
+
+            # Summarize last user message for logging
+            last_user = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    last_user = (m.get("content") or "")[:120]
+                    break
+
+            logger.info(
+                "REQ %s | model=%s stream=%s tools=%d msgs=%d extra=%s | user: %s",
+                req_id, model, stream,
+                len(tools) if tools else 0,
+                len(messages),
+                json.dumps(extra, ensure_ascii=False) if extra else "{}",
+                last_user or "(none)",
+            )
+            logger.debug("REQ %s BODY %s", req_id, json.dumps(body, ensure_ascii=False)[:2000])
+
             req = PendingRequest(
                 id=req_id,
-                model=body.get("model", "unknown"),
-                messages=body.get("messages", []),
-                tools=body.get("tools"),
+                model=model,
+                messages=messages,
+                tools=tools,
                 temperature=body.get("temperature"),
                 max_tokens=body.get("max_tokens"),
-                stream=body.get("stream", False),
+                stream=stream,
                 response_format=body.get("response_format"),
-                extra_body=body.get("extra_body"),
+                extra_body=extra,
             )
 
             # Check scripted responses
@@ -393,6 +722,18 @@ class MockLLMServer:
                 req.event.set()
                 with self._lock:
                     self._pending[req_id] = req
+                await self._broadcast({
+                    "type": "request_updated",
+                    "request": self._serialize(req),
+                    "pending": self._stats()["pending"],
+                    "completed": self._stats()["completed"],
+                })
+                logger.info(
+                    "REQ %s -> SCRIPT_MATCH response=%d chars, tool_calls=%d",
+                    req_id,
+                    len(req.response_content or ""),
+                    len(req.response_tool_calls) if req.response_tool_calls else 0,
+                )
                 if req.stream:
                     return _stream_response(req)
                 return JSONResponse(_build_chat_completion(req))
@@ -401,11 +742,34 @@ class MockLLMServer:
             with self._lock:
                 self._pending[req_id] = req
 
+            await self._broadcast({
+                "type": "new_request",
+                "request": self._serialize(req),
+                "pending": self._stats()["pending"],
+                "completed": self._stats()["completed"],
+            })
+
+            logger.info(
+                "REQ %s -> QUEUED (pending=%d, total=%d). Open http://localhost:%d to respond.",
+                req_id, self.pending_count(), len(self._pending), self.port,
+            )
+
             # Wait for operator response (event.set() from /api/requests/{id}/respond)
-            signalled = req.event.wait(timeout=3600)
+            # Use run_in_executor — threading.Event.wait() blocks the asyncio event loop otherwise
+            loop = asyncio.get_event_loop()
+            signalled = await loop.run_in_executor(None, req.event.wait, 3600)
             if not signalled:
                 req.status = "skipped"
                 req.response_content = "[timeout — no response from operator]"
+                logger.warning("REQ %s -> TIMEOUT (3600s)", req_id)
+            else:
+                logger.info(
+                    "REQ %s -> %s response=%d chars, tool_calls=%d",
+                    req_id,
+                    req.status.upper(),
+                    len(req.response_content or ""),
+                    len(req.response_tool_calls) if req.response_tool_calls else 0,
+                )
 
             if req.stream:
                 return _stream_response(req)
@@ -458,13 +822,27 @@ class MockLLMServer:
             with self._lock:
                 req = self._pending.get(req_id)
             if not req:
+                logger.warning("RESPOND %s -> 404 not found", req_id)
                 raise HTTPException(404, "Request not found")
             if req.status != "pending":
+                logger.warning("RESPOND %s -> 409 already handled (status=%s)", req_id, req.status)
                 raise HTTPException(409, "Request already handled")
             req.response_content = body.get("content", "")
             req.response_tool_calls = body.get("tool_calls")
             req.status = "completed"
             req.event.set()
+            logger.info(
+                "RESPOND %s -> COMPLETED content=%d chars, tool_calls=%d",
+                req_id,
+                len(req.response_content or ""),
+                len(req.response_tool_calls) if req.response_tool_calls else 0,
+            )
+            await self._broadcast({
+                "type": "request_updated",
+                "request": self._serialize(req),
+                "pending": self._stats()["pending"],
+                "completed": self._stats()["completed"],
+            })
             return {"status": "ok"}
 
         @app.post("/api/requests/{req_id}/skip")
@@ -472,12 +850,21 @@ class MockLLMServer:
             with self._lock:
                 req = self._pending.get(req_id)
             if not req:
+                logger.warning("SKIP %s -> 404 not found", req_id)
                 raise HTTPException(404, "Request not found")
             if req.status != "pending":
+                logger.warning("SKIP %s -> 409 already handled (status=%s)", req_id, req.status)
                 raise HTTPException(409, "Request already handled")
             req.response_content = ""
             req.status = "skipped"
             req.event.set()
+            logger.info("SKIP %s -> SKIPPED", req_id)
+            await self._broadcast({
+                "type": "request_updated",
+                "request": self._serialize(req),
+                "pending": self._stats()["pending"],
+                "completed": self._stats()["completed"],
+            })
             return {"status": "ok"}
 
         @app.get("/api/stats")
@@ -490,6 +877,27 @@ class MockLLMServer:
                 "skipped": sum(1 for r in items if r.status == "skipped"),
                 "total": len(items),
             }
+
+        @app.websocket("/ws")
+        async def ws_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            self._ws_clients.add(websocket)
+            # Send full current state on connect
+            with self._lock:
+                items = list(self._pending.values())
+            items.sort(key=lambda r: r.created_at, reverse=True)
+            st = self._stats()
+            await websocket.send_json({
+                "type": "init",
+                "requests": [self._serialize(r) for r in items],
+                "pending": st["pending"],
+                "completed": st["completed"],
+            })
+            try:
+                while True:
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                self._ws_clients.discard(websocket)
 
         return app
 
