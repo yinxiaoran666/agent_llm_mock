@@ -1,7 +1,7 @@
 [project]
 name = "agent-llm-mock"
 version = "0.1.0"
-description = "Local OpenAI-compatible LLM mock server with web dashboard for manual response control"
+description = "Local LLM mock server (OpenAI + Anthropic) with web dashboard for manual response control"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.100.0",

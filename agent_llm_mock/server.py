@@ -1,4 +1,4 @@
-"""Mock LLM server — OpenAI-compatible endpoint with web dashboard for manual response control."""
+"""Mock LLM server — OpenAI-compatible and Anthropic endpoints with web dashboard for manual response control."""
 
 import asyncio
 import json
@@ -50,6 +50,8 @@ class PendingRequest:
     stream: bool = False
     response_format: Optional[Dict] = None
     extra_body: Optional[Dict] = None
+    api_format: str = "openai"       # "openai" | "anthropic"
+    system_prompt: Optional[str] = None  # Anthropic top-level system
     created_at: float = field(default_factory=time.time)
     status: str = "pending"          # pending | completed | skipped
     response_content: Optional[str] = None
@@ -110,6 +112,99 @@ def _build_chat_completion(req: PendingRequest) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Anthropic Messages API helpers
+# ---------------------------------------------------------------------------
+
+def _convert_openai_tool_to_anthropic(tool: dict) -> dict:
+    """OpenAI tool → Anthropic tool format."""
+    fn = tool.get("function", tool)
+    return {
+        "name": fn.get("name", "unknown"),
+        "description": fn.get("description", ""),
+        "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+    }
+
+
+def _convert_tool_calls_to_anthropic_content(tool_calls: list) -> list:
+    """OpenAI tool_calls → Anthropic content blocks (tool_use)."""
+    blocks = []
+    for tc in tool_calls or []:
+        fn = tc.get("function", {})
+        try:
+            inp = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            inp = {}
+        blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id", "toolu_" + uuid.uuid4().hex[:12]),
+            "name": fn.get("name", "unknown"),
+            "input": inp,
+        })
+    return blocks
+
+
+def _build_anthropic_response(req: PendingRequest) -> dict:
+    """Build an Anthropic-format Message response from operator input."""
+    content = []
+    if req.response_content:
+        content.append({"type": "text", "text": req.response_content})
+    if req.response_tool_calls:
+        content.extend(_convert_tool_calls_to_anthropic_content(req.response_tool_calls))
+
+    stop_reason = "end_turn"
+    if req.response_tool_calls:
+        stop_reason = "tool_use"
+
+    prompt_tokens = _estimate_tokens(req.messages)
+    if req.system_prompt:
+        prompt_tokens += _estimate_tokens(req.system_prompt)
+    completion_tokens = _estimate_tokens(req.response_content or "")
+
+    return {
+        "id": f"msg_mock-{req.id[:12]}",
+        "type": "message",
+        "role": "assistant",
+        "model": req.model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+        },
+    }
+
+
+def _anthropic_stream_response(req: PendingRequest):
+    """SSE streaming response in Anthropic format."""
+    msg = _build_anthropic_response(req)
+
+    async def event_stream():
+        # message_start
+        yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': msg}, ensure_ascii=False)}\n\n"
+        # content blocks
+        for i, block in enumerate(msg["content"]):
+            if block["type"] == "text":
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': i, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n"
+                text = block.get("text", "")
+                chunk_size = 20
+                for pos in range(0, len(text), chunk_size):
+                    snippet = text[pos:pos + chunk_size]
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'text_delta', 'text': snippet}}, ensure_ascii=False)}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i}, ensure_ascii=False)}\n\n"
+            elif block["type"] == "tool_use":
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': i, 'content_block': {'type': 'tool_use', 'id': block['id'], 'name': block['name'], 'input': {}}}, ensure_ascii=False)}\n\n"
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(block.get('input', {}), ensure_ascii=False)}}, ensure_ascii=False)}\n\n"
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i}, ensure_ascii=False)}\n\n"
+        # message_delta
+        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': msg['stop_reason'], 'stop_sequence': None}, 'usage': {'output_tokens': msg['usage']['output_tokens']}}, ensure_ascii=False)}\n\n"
+        # message_stop
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
 # Scripted responses
 # ---------------------------------------------------------------------------
 
@@ -123,10 +218,43 @@ def _load_scripts(path: Optional[str]) -> List[Dict]:
         return []
 
 
+def _extract_text_content(content) -> str:
+    """Extract plain text from OpenAI/Anthropic content field (str | list | None)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                t = part.get("type", "")
+                if t == "text":
+                    parts.append(part.get("text", ""))
+                elif t in ("image_url", "image"):
+                    parts.append("[image]")
+                elif t == "input_audio":
+                    parts.append("[audio]")
+                elif t == "file":
+                    parts.append("[file]")
+                elif t == "tool_use":
+                    inp = json.dumps(part.get("input", {}), ensure_ascii=False)
+                    parts.append(f"[tool_use: {part.get('name', 'unknown')}({inp})]")
+                elif t == "tool_result":
+                    inner = part.get("content", "")
+                    parts.append(f"[tool_result: {_extract_text_content(inner)}]")
+                else:
+                    parts.append(str(part))
+            elif isinstance(part, str):
+                parts.append(part)
+        return " ".join(parts)
+    return str(content)
+
+
 def _match_script(req: PendingRequest, scripts: List[Dict]) -> Optional[Dict]:
     """Return the first matching script entry, or None."""
     combined = " ".join(
-        m.get("content", "") or ""
+        _extract_text_content(m.get("content"))
         for m in req.messages
         if m.get("role") in ("user", "system")
     ).lower()
@@ -239,7 +367,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="empty-state">
     <div class="icon">&#128179;</div>
     <p>Waiting for requests...</p>
-    <p style="font-size:0.8rem;margin-top:4px;">Point your agent's base_url to http://HOST:PORT/v1</p>
+    <p style="font-size:0.8rem;margin-top:4px;">OpenAI: /v1/chat/completions  |  Anthropic: /v1/messages</p>
   </div>
 </div>
 
@@ -251,6 +379,23 @@ let ws = null;
 function genCallId() { return 'call_' + crypto.randomUUID().replace(/-/g,'').substring(0,12); }
 
 function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function extractPreview(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    var parts = [];
+    content.forEach(function(p) {
+      if (!p || typeof p !== 'object') { parts.push(String(p)); return; }
+      if (p.type === 'text') parts.push(p.text || '');
+      else if (p.type === 'tool_use') parts.push('[tool_use: ' + (p.name || '') + ']');
+      else if (p.type === 'tool_result') parts.push('[tool_result]');
+      else if (p.type === 'image' || p.type === 'image_url') parts.push('[image]');
+      else parts.push('[' + (p.type || 'block') + ']');
+    });
+    return parts.join(' ');
+  }
+  return String(content || '');
+}
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -304,7 +449,7 @@ function buildCardHTML(r) {
 
 function buildCardHeaderHTML(r) {
   var lastUser = (r.messages || []).filter(function(m){ return m.role === 'user'; }).pop();
-  var preview = lastUser ? (lastUser.content || '').substring(0, 100) : '(system prompt)';
+  var preview = lastUser ? extractPreview(lastUser.content) : '(system prompt)';
   var toolCount = r.tools ? r.tools.length : 0;
   var badges = toolCount > 0 ? '<span style=\"color:#888;font-size:0.75rem;\">+'+toolCount+' tools</span>' : '';
   return '<div class=\"req-card-header\" onclick=\"toggleRequest(\''+r.id+'\')\">'
@@ -592,7 +737,7 @@ connectWs();
 # ---------------------------------------------------------------------------
 
 class MockLLMServer:
-    """Local OpenAI-compatible LLM mock server with web dashboard."""
+    """Local LLM mock server with OpenAI and Anthropic endpoints + web dashboard."""
 
     def __init__(self, port: int = 9999, host: str = "0.0.0.0", scripts_path: str = None):
         self.port = port
@@ -609,9 +754,10 @@ class MockLLMServer:
     def start(self):
         """Start the server (blocking)."""
         print(f"\n  Mock LLM Server running at http://{self.host}:{self.port}")
-        print(f"  Web dashboard:  http://localhost:{self.port}")
-        print(f"  API endpoint:   http://localhost:{self.port}/v1/chat/completions")
-        print(f"  Set agent.yaml: base_url: http://localhost:{self.port}/v1")
+        print(f"  Web dashboard:      http://localhost:{self.port}")
+        print(f"  OpenAI endpoint:    http://localhost:{self.port}/v1/chat/completions")
+        print(f"  Anthropic endpoint: http://localhost:{self.port}/v1/messages")
+        print(f"  Set agent.yaml:     base_url: http://localhost:{self.port}/v1")
         if self._scripts:
             print(f"  Scripts loaded: {len(self._scripts)} patterns")
         print()
@@ -649,6 +795,8 @@ class MockLLMServer:
             "response_tool_calls": req.response_tool_calls,
             "response_format": req.response_format,
             "extra_body": req.extra_body,
+            "api_format": req.api_format,
+            "system_prompt": req.system_prompt,
         }
 
     async def _broadcast(self, msg: dict):
@@ -775,6 +923,119 @@ class MockLLMServer:
                 return _stream_response(req)
             return JSONResponse(_build_chat_completion(req))
 
+        @app.post("/v1/messages")
+        async def anthropic_messages(request: Request):
+            body = await request.json()
+
+            req_id = uuid.uuid4().hex[:16]
+            model = body.get("model", "claude-sonnet-4-6")
+            messages = body.get("messages", [])
+            system = body.get("system", "")
+            anthropic_tools = body.get("tools")
+            stream = body.get("stream", False)
+
+            # Convert Anthropic tools → OpenAI format for dashboard compatibility
+            openai_tools = None
+            if anthropic_tools:
+                openai_tools = []
+                for t in anthropic_tools:
+                    openai_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": t.get("name", "unknown"),
+                            "description": t.get("description", ""),
+                            "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+                        }
+                    })
+
+            # Summarize last user message for logging
+            last_user = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    last_user = _extract_text_content(m.get("content", ""))
+                    break
+
+            logger.info(
+                "REQ %s | model=%s stream=%s tools=%d msgs=%d format=anthropic | user: %s",
+                req_id, model, stream,
+                len(anthropic_tools) if anthropic_tools else 0,
+                len(messages),
+                last_user or "(none)",
+            )
+            logger.debug("REQ %s BODY %s", req_id, json.dumps(body, ensure_ascii=False)[:2000])
+
+            req = PendingRequest(
+                id=req_id,
+                model=model,
+                messages=messages,
+                tools=openai_tools,
+                temperature=body.get("temperature"),
+                max_tokens=body.get("max_tokens"),
+                stream=stream,
+                api_format="anthropic",
+                system_prompt=system if isinstance(system, str) else (json.dumps(system, ensure_ascii=False) if system else None),
+            )
+
+            # Check scripted responses
+            script_match = _match_script(req, self._scripts)
+            if script_match:
+                req.response_content = script_match.get("content", "")
+                req.response_tool_calls = script_match.get("tool_calls")
+                req.status = "completed"
+                req.event.set()
+                with self._lock:
+                    self._pending[req_id] = req
+                await self._broadcast({
+                    "type": "request_updated",
+                    "request": self._serialize(req),
+                    "pending": self._stats()["pending"],
+                    "completed": self._stats()["completed"],
+                })
+                logger.info(
+                    "REQ %s -> SCRIPT_MATCH response=%d chars, tool_calls=%d",
+                    req_id,
+                    len(req.response_content or ""),
+                    len(req.response_tool_calls) if req.response_tool_calls else 0,
+                )
+                if req.stream:
+                    return _anthropic_stream_response(req)
+                return JSONResponse(_build_anthropic_response(req))
+
+            # Queue and wait
+            with self._lock:
+                self._pending[req_id] = req
+
+            await self._broadcast({
+                "type": "new_request",
+                "request": self._serialize(req),
+                "pending": self._stats()["pending"],
+                "completed": self._stats()["completed"],
+            })
+
+            logger.info(
+                "REQ %s -> QUEUED (pending=%d, total=%d). Open http://localhost:%d to respond.",
+                req_id, self.pending_count(), len(self._pending), self.port,
+            )
+
+            loop = asyncio.get_event_loop()
+            signalled = await loop.run_in_executor(None, req.event.wait, 3600)
+            if not signalled:
+                req.status = "skipped"
+                req.response_content = "[timeout — no response from operator]"
+                logger.warning("REQ %s -> TIMEOUT (3600s)", req_id)
+            else:
+                logger.info(
+                    "REQ %s -> %s response=%d chars, tool_calls=%d",
+                    req_id,
+                    req.status.upper(),
+                    len(req.response_content or ""),
+                    len(req.response_tool_calls) if req.response_tool_calls else 0,
+                )
+
+            if req.stream:
+                return _anthropic_stream_response(req)
+            return JSONResponse(_build_anthropic_response(req))
+
         @app.get("/", response_class=HTMLResponse)
         async def dashboard():
             return DASHBOARD_HTML
@@ -785,17 +1046,7 @@ class MockLLMServer:
                 items = list(self._pending.values())
             items.sort(key=lambda r: r.created_at, reverse=True)
             return {
-                "requests": [
-                    {
-                        "id": r.id, "model": r.model, "messages": r.messages,
-                        "tools": r.tools, "temperature": r.temperature,
-                        "max_tokens": r.max_tokens, "stream": r.stream,
-                        "status": r.status, "created_at": r.created_at,
-                        "response_content": r.response_content,
-                        "response_tool_calls": r.response_tool_calls,
-                    }
-                    for r in items
-                ],
+                "requests": [self._serialize(r) for r in items],
                 "pending": sum(1 for r in items if r.status == "pending"),
                 "completed": sum(1 for r in items if r.status != "pending"),
             }
@@ -806,16 +1057,7 @@ class MockLLMServer:
                 req = self._pending.get(req_id)
             if not req:
                 raise HTTPException(404, "Request not found")
-            return {
-                "id": req.id, "model": req.model, "messages": req.messages,
-                "tools": req.tools, "temperature": req.temperature,
-                "max_tokens": req.max_tokens, "stream": req.stream,
-                "status": req.status, "created_at": req.created_at,
-                "response_content": req.response_content,
-                "response_tool_calls": req.response_tool_calls,
-                "response_format": req.response_format,
-                "extra_body": req.extra_body,
-            }
+            return self._serialize(req)
 
         @app.post("/api/requests/{req_id}/respond")
         async def respond(req_id: str, body: dict):

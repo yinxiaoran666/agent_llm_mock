@@ -1,0 +1,11 @@
+[
+    {
+    "match":{"text_contains":[
+            "帮我看下桌面有啥文件夹",
+            "classify the user's intent from the list below"
+        ]},
+    "response":{
+        "content":"{\"intent_name\": \"tool_call\", \"confidence\": 0.9, \"parameters\": {}}"
+    }
+    }
+]

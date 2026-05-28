@@ -1,4 +1,4 @@
-"""agent-llm-mock — Local OpenAI-compatible LLM mock server.
+"""agent-llm-mock — Local LLM mock server (OpenAI + Anthropic endpoints).
 
 Usage:
     CLI:        agent-llm-mock --port 9999
