@@ -1,0 +1,12 @@
+[
+  {
+    "match": {"api_format": "openai"},
+    "target_url": "https://api.deepseek.com/v1",
+    "timeout": 30
+  },
+  {
+    "match": {"api_format": "anthropic"},
+    "target_url": "https://api.deepseek.com/anthropic",
+    "timeout": 30
+  }
+]

@@ -7,9 +7,11 @@ import sys
 import time
 import uuid
 import threading
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 import uvicorn
@@ -53,10 +55,17 @@ class PendingRequest:
     api_format: str = "openai"       # "openai" | "anthropic"
     system_prompt: Optional[str] = None  # Anthropic top-level system
     created_at: float = field(default_factory=time.time)
-    status: str = "pending"          # pending | completed | skipped
+    status: str = "pending"          # pending | completed | skipped | forwarded
     response_content: Optional[str] = None
     response_tool_calls: Optional[List[Dict]] = None
     event: threading.Event = field(default_factory=threading.Event)
+    # Forwarding fields
+    raw_request_body: Optional[Dict] = None
+    raw_request_headers: Optional[Dict] = None
+    forwarded_request: Optional[Dict] = None   # {url, headers, body}
+    forwarded_response: Optional[Dict] = None  # {status_code, headers, body}
+    forwarded_rule: Optional[Dict] = None      # matched rule
+    forwarded_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +276,190 @@ def _match_script(req: PendingRequest, scripts: List[Dict]) -> Optional[Dict]:
 
 
 # ---------------------------------------------------------------------------
+# Forwarding helpers
+# ---------------------------------------------------------------------------
+
+def _load_forward_config(path: Optional[str]) -> List[Dict]:
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        logger.warning("Failed to load forward config from %s: %s", path, exc)
+        return []
+
+
+def _match_forward_rule(req: PendingRequest, forward_config: List[Dict]) -> Optional[Dict]:
+    """Return the first forward rule matching this request, or None.
+
+    Rules evaluated in order; first match wins.
+    All match fields are AND-ed. Omitted fields match everything.
+    """
+    if not forward_config:
+        return None
+
+    combined = " ".join(
+        _extract_text_content(m.get("content"))
+        for m in req.messages
+        if m.get("role") in ("user", "system")
+    ).lower()
+
+    for rule in forward_config:
+        match_cfg = rule.get("match", {})
+        if not match_cfg:
+            return rule
+
+        api_format = match_cfg.get("api_format")
+        model_contains = match_cfg.get("model_contains")
+        texts = match_cfg.get("text_contains", [])
+        stream_match = match_cfg.get("stream")
+
+        if api_format and api_format != req.api_format:
+            continue
+        if model_contains and model_contains.lower() not in req.model.lower():
+            continue
+        if texts and not all(t.lower() in combined for t in texts):
+            continue
+        if stream_match is not None and stream_match != req.stream:
+            continue
+
+        return rule
+
+    return None
+
+
+def _build_forward_url(rule: Dict, req: PendingRequest) -> str:
+    """Build the full upstream URL from the rule's target_url and the request path.
+
+    target_url should be the API base path, e.g.:
+      - OpenAI/DeepSeek:  https://api.deepseek.com/v1
+      - Anthropic:         https://api.anthropic.com/v1
+
+    The endpoint path (/chat/completions or /messages) is appended automatically.
+    The resulting URL is stored in forwarded_request.url for dashboard display.
+    """
+    target_base = rule["target_url"].rstrip("/")
+    if req.api_format == "openai":
+        url = f"{target_base}/chat/completions"
+    else:
+        url = f"{target_base}/messages"
+    logger.debug("FORWARD %s -> URL %s", req.id, url)
+    return url
+
+
+async def _forward_request(
+    req: PendingRequest,
+    rule: Dict,
+    client: httpx.AsyncClient,
+    request_headers: Dict[str, str],
+) -> Optional[Dict]:
+    """Forward a non-streaming request upstream. Returns response dict or None on failure."""
+    url = _build_forward_url(rule, req)
+    timeout = rule.get("timeout", 30)
+    body = deepcopy(req.raw_request_body) if req.raw_request_body else {}
+
+    # Build forwarding headers (pass through client headers selectively)
+    forward_headers = {"Content-Type": "application/json"}
+    for h in ("authorization", "x-api-key", "anthropic-version", "x-custom"):
+        if h in request_headers:
+            forward_headers[h] = request_headers[h]
+
+    req.forwarded_request = {"url": url, "headers": dict(forward_headers), "body": body}
+
+    try:
+        resp = await client.post(url, json=body, headers=forward_headers, timeout=timeout)
+        try:
+            resp_body = resp.json()
+        except json.JSONDecodeError:
+            resp_body = resp.text
+
+        req.forwarded_response = {
+            "status_code": resp.status_code,
+            "headers": dict(resp.headers),
+            "body": resp_body,
+        }
+        return req.forwarded_response
+    except httpx.TimeoutException:
+        logger.warning("FORWARD %s -> TIMEOUT after %ds", req.id, timeout)
+        req.forwarded_error = f"Timeout after {timeout}s"
+        return None
+    except httpx.HTTPStatusError as exc:
+        logger.warning("FORWARD %s -> HTTP %s: %s", req.id, exc.response.status_code,
+                       exc.response.text[:500] if exc.response.text else "(no body)")
+        req.forwarded_error = f"HTTP {exc.response.status_code}"
+        req.forwarded_response = {
+            "status_code": exc.response.status_code,
+            "headers": dict(exc.response.headers),
+            "body": exc.response.text[:2000] if exc.response.text else "",
+        }
+        return None
+    except httpx.RequestError as exc:
+        logger.warning("FORWARD %s -> REQUEST_ERROR: %s", req.id, exc)
+        req.forwarded_error = f"Request error: {exc}"
+        return None
+
+
+async def _proxy_stream_response(
+    req: PendingRequest,
+    rule: Dict,
+    client: httpx.AsyncClient,
+    request_headers: Dict[str, str],
+) -> StreamingResponse:
+    """Forward a streaming request upstream and proxy the SSE back to the client."""
+    url = _build_forward_url(rule, req)
+    timeout = rule.get("timeout", 30)
+    body = deepcopy(req.raw_request_body) if req.raw_request_body else {}
+
+    forward_headers = {"Content-Type": "application/json"}
+    for h in ("authorization", "x-api-key", "anthropic-version", "x-custom"):
+        if h in request_headers:
+            forward_headers[h] = request_headers[h]
+
+    req.forwarded_request = {"url": url, "headers": dict(forward_headers), "body": body}
+
+    async def stream_proxy():
+        buffer = bytearray()
+        upstream_status = None
+        upstream_resp_headers = {}
+        error = None
+        try:
+            async with client.stream("POST", url, json=body, headers=forward_headers,
+                                     timeout=timeout) as upstream_resp:
+                upstream_status = upstream_resp.status_code
+                upstream_resp_headers = dict(upstream_resp.headers)
+                async for chunk in upstream_resp.aiter_bytes():
+                    buffer.extend(chunk)
+                    yield chunk
+        except Exception as exc:
+            logger.warning("FORWARD_STREAM %s -> FAILED: %s", req.id, exc)
+            error = str(exc)
+        finally:
+            full_text = buffer.decode("utf-8", errors="replace")
+            req.forwarded_response = {
+                "status_code": upstream_status or 0,
+                "headers": upstream_resp_headers,
+                "body": full_text,
+                "stream": True,
+            }
+            if error:
+                req.forwarded_error = error
+            req.status = "forwarded"
+            req.event.set()
+            try:
+                await req._broadcast_callback({
+                    "type": "request_updated",
+                    "request": req._serialize_callback(req),
+                    "pending": req._stats_callback()["pending"],
+                    "completed": req._stats_callback()["completed"],
+                })
+            except Exception:
+                pass
+
+    return StreamingResponse(stream_proxy(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
 # Web dashboard HTML
 # ---------------------------------------------------------------------------
 
@@ -304,6 +497,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .badge.pending { background: var(--orange); color: #000; }
   .badge.completed { background: var(--green); color: #000; }
   .badge.skipped { background: #666; color: #fff; }
+  .badge.forwarded { background: var(--blue); color: #fff; }
+  .badge.forwarding { background: var(--purple); color: #fff; }
   .req-card-detail { display: none; padding: 0 16px 16px; border-top: 1px solid var(--border); }
   .req-card.expanded .req-card-detail { display: block; }
   .section-title { font-size: 1rem; font-weight: bold; margin: 14px 0 6px; color: #aaa; }
@@ -316,6 +511,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .btn-skip { background: var(--red); color: #fff; }
   .empty-state { text-align: center; padding: 40px; color: #666; }
   .empty-state .icon { font-size: 2rem; }
+
+  /* Forward URL display */
+  .fwd-url-box { background: #0a0a18; border: 1px solid #444; border-radius: 6px; padding: 10px 14px;
+    font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.85rem; color: #8be9fd;
+    word-break: break-all; margin-bottom: 4px; }
+  .fwd-method { background: var(--green); color: #000; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.75rem; font-weight: 700; margin-right: 6px; }
 
   /* Tool mock module */
   .tool-module { background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
@@ -491,8 +693,13 @@ function handleRequestUpdated(msg) {
   if (msg.request.id === expandedId && msg.request.status !== 'pending') {
     var detail = document.getElementById('detail-'+msg.request.id);
     if (detail) {
-      var btnRow = detail.querySelector('.btn-row');
-      if (btnRow) btnRow.style.display = 'none';
+      // For forwarded, rebuild detail to show upstream request/response
+      if (msg.request.status === 'forwarded') {
+        detail.innerHTML = buildDetailHTML(msg.request);
+      } else {
+        var btnRow = detail.querySelector('.btn-row');
+        if (btnRow) btnRow.style.display = 'none';
+      }
     }
   }
 }
@@ -585,26 +792,67 @@ function buildDetailHTML(r) {
       +'<div class=\"preview-box\" id=\"previewContent-'+r.id+'\"></div></div>';
   }
 
+  // ---- Forwarded request/response panel (read-only) ----
+  function buildForwardedHTML(r) {
+    var html = '';
+    html += '<div class=\"section-title\">Forwarding Rule</div>';
+    html += '<div class=\"raw-json\">'+esc(JSON.stringify(r.forwarded_rule||{}, null, 2))+'</div>';
+
+    if (r.forwarded_request) {
+      var fr = r.forwarded_request;
+      html += '<div class=\"section-title\">Upstream Request</div>';
+      html += '<div class=\"fwd-url-box\"><span class=\"fwd-method\">POST</span> '+esc(fr.url||'?')+'</div>';
+      html += '<div class=\"section-title\" style=\"margin-top:12px;\">Request Headers</div>';
+      html += '<div class=\"raw-json\">'+esc(JSON.stringify(fr.headers||{}, null, 2))+'</div>';
+    }
+
+    if (r.forwarded_response) {
+      var frp = r.forwarded_response;
+      html += '<div class=\"section-title\">Upstream Response</div>';
+      html += '<div style=\"font-size:0.85rem;margin-bottom:8px;\">Status: <b style=\"color:'+(frp.status_code>=200&&frp.status_code<300?'var(--green)':'var(--red)')+'\">'+frp.status_code+'</b>';
+      if (frp.stream) html += ' <span style=\"color:var(--purple);\">[stream]</span>';
+      html += '</div>';
+      html += '<div class=\"section-title\">Response Headers</div>';
+      html += '<div class=\"raw-json\">'+esc(JSON.stringify(frp.headers||{}, null, 2))+'</div>';
+      html += '<div class=\"section-title\">Response Body</div>';
+      html += '<div class=\"raw-json\">'+esc(typeof frp.body==='string'?frp.body:JSON.stringify(frp.body||{}, null, 2))+'</div>';
+    }
+
+    if (r.forwarded_error) {
+      html += '<div class=\"section-title\" style=\"color:var(--red);\">Forward Error</div>';
+      html += '<div style=\"color:var(--red);font-size:0.85rem;\">'+esc(r.forwarded_error)+'</div>';
+    }
+    return html;
+  }
+
   var buttonsHTML = '';
   if (r.status === 'pending') {
     buttonsHTML = '<div class=\"btn-row\">'
       +'<button class=\"btn btn-submit\" onclick=\"submitResponse(\''+r.id+'\')\">Submit Response</button>'
       +'<button class=\"btn btn-skip\" onclick=\"skipRequest(\''+r.id+'\')\">Skip (empty response)</button>'
       +'</div>';
-  } else {
+  } else if (r.status !== 'forwarded') {
     buttonsHTML = '<div style=\"margin-top:12px;color:#666;font-size:0.85rem;\">Request already '+esc(r.status)+' &mdash; no further action needed.</div>';
   }
 
-  return '<div class=\"section-title\">Request Detail</div>'
-    +'<div class=\"raw-json\">'+esc(JSON.stringify({
+  var detailHTML = '<div class=\"section-title\">Request Detail</div>'
+    +'<div class=\"raw-json\">'+esc(JSON.stringify(r.raw_request_body||{
       model: r.model, messages: r.messages, temperature: r.temperature,
       max_tokens: r.max_tokens, stream: r.stream, tools: r.tools,
       response_format: r.response_format, extra_body: r.extra_body,
-    }, null, 2))+'</div>'
-    +'<div class=\"section-title\">Response Text</div>'
-    +'<textarea class=\"detail-response-text\" id=\"respText-'+r.id+'\" placeholder=\"Type assistant text response here...\">'+esc(r.response_content||'')+'</textarea>'
-    +toolsHTML
-    +buttonsHTML;
+    }, null, 2))+'</div>';
+
+  if (r.status === 'forwarded') {
+    detailHTML += buildForwardedHTML(r);
+    detailHTML += buttonsHTML;
+  } else {
+    detailHTML += '<div class=\"section-title\">Response Text</div>'
+      +'<textarea class=\"detail-response-text\" id=\"respText-'+r.id+'\" placeholder=\"Type assistant text response here...\">'+esc(r.response_content||'')+'</textarea>'
+      +toolsHTML
+      +buttonsHTML;
+  }
+
+  return detailHTML;
 }
 
 // ---- Expand / collapse ----
@@ -739,12 +987,15 @@ connectWs();
 class MockLLMServer:
     """Local LLM mock server with OpenAI and Anthropic endpoints + web dashboard."""
 
-    def __init__(self, port: int = 9999, host: str = "0.0.0.0", scripts_path: str = None):
+    def __init__(self, port: int = 9999, host: str = "0.0.0.0",
+                 scripts_path: str = None, forward_config_path: str = None):
         self.port = port
         self.host = host
         self._pending: Dict[str, PendingRequest] = {}
         self._lock = threading.Lock()
         self._scripts = _load_scripts(scripts_path)
+        self._forward_config = _load_forward_config(forward_config_path)
+        self._http_client = httpx.AsyncClient(timeout=30.0) if self._forward_config else None
         self._server_thread: Optional[threading.Thread] = None
         self._ws_clients: set = set()
         self._app = self._create_app()
@@ -760,6 +1011,8 @@ class MockLLMServer:
         print(f"  Set agent.yaml:     base_url: http://localhost:{self.port}/v1")
         if self._scripts:
             print(f"  Scripts loaded: {len(self._scripts)} patterns")
+        if self._forward_config:
+            print(f"  Forward rules:  {len(self._forward_config)} configured")
         print()
         uvicorn.run(self._app, host=self.host, port=self.port, log_level="info")
 
@@ -797,6 +1050,12 @@ class MockLLMServer:
             "extra_body": req.extra_body,
             "api_format": req.api_format,
             "system_prompt": req.system_prompt,
+            "raw_request_body": req.raw_request_body,
+            "raw_request_headers": req.raw_request_headers,
+            "forwarded_request": req.forwarded_request,
+            "forwarded_response": req.forwarded_response,
+            "forwarded_rule": req.forwarded_rule,
+            "forwarded_error": req.forwarded_error,
         }
 
     async def _broadcast(self, msg: dict):
@@ -824,6 +1083,7 @@ class MockLLMServer:
         @app.post("/v1/chat/completions")
         async def chat_completions(request: Request):
             body = await request.json()
+            request_headers = {k.lower(): v for k, v in request.headers.items()}
 
             req_id = uuid.uuid4().hex[:16]
             model = body.get("model", "unknown")
@@ -859,6 +1119,8 @@ class MockLLMServer:
                 stream=stream,
                 response_format=body.get("response_format"),
                 extra_body=extra,
+                raw_request_body=body,
+                raw_request_headers=request_headers,
             )
 
             # Check scripted responses
@@ -885,6 +1147,50 @@ class MockLLMServer:
                 if req.stream:
                     return _stream_response(req)
                 return JSONResponse(_build_chat_completion(req))
+
+            # Forwarding check
+            forward_rule = _match_forward_rule(req, self._forward_config)
+            if forward_rule:
+                req.forwarded_rule = forward_rule
+                logger.info(
+                    "REQ %s -> FORWARD_MATCH target=%s timeout=%d",
+                    req_id, forward_rule.get("target_url"),
+                    forward_rule.get("timeout", 30),
+                )
+
+                if req.stream:
+                    with self._lock:
+                        self._pending[req_id] = req
+                    await self._broadcast({
+                        "type": "new_request",
+                        "request": self._serialize(req),
+                        "pending": self._stats()["pending"],
+                        "completed": self._stats()["completed"],
+                    })
+                    req._broadcast_callback = self._broadcast
+                    req._serialize_callback = self._serialize
+                    req._stats_callback = self._stats
+                    return await _proxy_stream_response(req, forward_rule, self._http_client, request_headers)
+
+                upstream_resp = await _forward_request(req, forward_rule, self._http_client, request_headers)
+                if upstream_resp:
+                    req.status = "forwarded"
+                    req.event.set()
+                    with self._lock:
+                        self._pending[req_id] = req
+                    await self._broadcast({
+                        "type": "request_updated",
+                        "request": self._serialize(req),
+                        "pending": self._stats()["pending"],
+                        "completed": self._stats()["completed"],
+                    })
+                    logger.info(
+                        "REQ %s -> FORWARDED status=%d",
+                        req_id, upstream_resp["status_code"],
+                    )
+                    return JSONResponse(upstream_resp["body"])
+
+                logger.warning("REQ %s -> FORWARD_FAILED, falling through to queue", req_id)
 
             # Queue and wait
             with self._lock:
@@ -926,6 +1232,7 @@ class MockLLMServer:
         @app.post("/v1/messages")
         async def anthropic_messages(request: Request):
             body = await request.json()
+            request_headers = {k.lower(): v for k, v in request.headers.items()}
 
             req_id = uuid.uuid4().hex[:16]
             model = body.get("model", "claude-sonnet-4-6")
@@ -974,6 +1281,8 @@ class MockLLMServer:
                 stream=stream,
                 api_format="anthropic",
                 system_prompt=system if isinstance(system, str) else (json.dumps(system, ensure_ascii=False) if system else None),
+                raw_request_body=body,
+                raw_request_headers=request_headers,
             )
 
             # Check scripted responses
@@ -1000,6 +1309,50 @@ class MockLLMServer:
                 if req.stream:
                     return _anthropic_stream_response(req)
                 return JSONResponse(_build_anthropic_response(req))
+
+            # Forwarding check
+            forward_rule = _match_forward_rule(req, self._forward_config)
+            if forward_rule:
+                req.forwarded_rule = forward_rule
+                logger.info(
+                    "REQ %s -> FORWARD_MATCH target=%s timeout=%d",
+                    req_id, forward_rule.get("target_url"),
+                    forward_rule.get("timeout", 30),
+                )
+
+                if req.stream:
+                    with self._lock:
+                        self._pending[req_id] = req
+                    await self._broadcast({
+                        "type": "new_request",
+                        "request": self._serialize(req),
+                        "pending": self._stats()["pending"],
+                        "completed": self._stats()["completed"],
+                    })
+                    req._broadcast_callback = self._broadcast
+                    req._serialize_callback = self._serialize
+                    req._stats_callback = self._stats
+                    return await _proxy_stream_response(req, forward_rule, self._http_client, request_headers)
+
+                upstream_resp = await _forward_request(req, forward_rule, self._http_client, request_headers)
+                if upstream_resp:
+                    req.status = "forwarded"
+                    req.event.set()
+                    with self._lock:
+                        self._pending[req_id] = req
+                    await self._broadcast({
+                        "type": "request_updated",
+                        "request": self._serialize(req),
+                        "pending": self._stats()["pending"],
+                        "completed": self._stats()["completed"],
+                    })
+                    logger.info(
+                        "REQ %s -> FORWARDED status=%d",
+                        req_id, upstream_resp["status_code"],
+                    )
+                    return JSONResponse(upstream_resp["body"])
+
+                logger.warning("REQ %s -> FORWARD_FAILED, falling through to queue", req_id)
 
             # Queue and wait
             with self._lock:
