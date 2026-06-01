@@ -9,7 +9,7 @@ import uuid
 import threading
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
@@ -124,15 +124,6 @@ def _build_chat_completion(req: PendingRequest) -> dict:
 # Anthropic Messages API helpers
 # ---------------------------------------------------------------------------
 
-def _convert_openai_tool_to_anthropic(tool: dict) -> dict:
-    """OpenAI tool → Anthropic tool format."""
-    fn = tool.get("function", tool)
-    return {
-        "name": fn.get("name", "unknown"),
-        "description": fn.get("description", ""),
-        "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
-    }
-
 
 def _convert_tool_calls_to_anthropic_content(tool_calls: list) -> list:
     """OpenAI tool_calls → Anthropic content blocks (tool_use)."""
@@ -150,6 +141,194 @@ def _convert_tool_calls_to_anthropic_content(tool_calls: list) -> list:
             "input": inp,
         })
     return blocks
+
+
+def _extract_tool_calls_from_response(resp_body: Dict, api_format: str) -> Optional[List]:
+    """Extract tool calls from an upstream LLM response body.
+    Returns list of tool calls in OpenAI format, or None.
+    """
+    if api_format == "openai":
+        choices = resp_body.get("choices", [])
+        if not choices:
+            return None
+        msg = choices[0].get("message", {})
+        tool_calls = msg.get("tool_calls")
+        return tool_calls if tool_calls else None
+
+    if api_format == "anthropic":
+        content = resp_body.get("content", [])
+        if not content:
+            return None
+        result = []
+        for block in content:
+            if block.get("type") != "tool_use":
+                continue
+            inp = block.get("input", {})
+            result.append({
+                "id": block.get("id", "toolu_" + uuid.uuid4().hex[:12]),
+                "type": "function",
+                "function": {
+                    "name": block.get("name", "unknown"),
+                    "arguments": json.dumps(inp, ensure_ascii=False),
+                },
+            })
+        return result if result else None
+
+    return None
+
+
+def _enrich_tool_calls_with_descriptions(tool_calls: list, tools: list) -> list:
+    """Add description field to each tool call by cross-referencing request tool definitions."""
+    if not tool_calls or not tools:
+        return tool_calls or []
+
+    # Build name → description lookup from request tools
+    desc_map = {}
+    for t in tools or []:
+        fn = t.get("function", {})
+        name = fn.get("name", "")
+        if name:
+            desc_map[name] = fn.get("description", "")
+
+    for tc in tool_calls:
+        name = tc.get("function", {}).get("name", "")
+        if name in desc_map:
+            tc["function"]["description"] = desc_map[name]
+
+    return tool_calls
+
+
+def _extract_tool_calls_from_sse(full_text: str, api_format: str) -> Optional[List]:
+    """Extract tool calls from accumulated SSE stream text.
+    Parses SSE data lines and reconstructs tool calls from streaming deltas.
+    """
+    if not full_text:
+        return None
+
+    data_objects = []
+    for line in full_text.split("\n"):
+        line = line.strip()
+        if line.startswith("data: "):
+            payload = line[6:]
+            if payload == "[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+                data_objects.append(obj)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    if not data_objects:
+        return None
+
+    if api_format == "openai":
+        return _merge_openai_streaming_tool_calls(data_objects)
+    elif api_format == "anthropic":
+        return _extract_anthropic_streaming_tool_calls(data_objects)
+
+    return None
+
+
+def _merge_openai_streaming_tool_calls(data_objects: List[Dict]) -> Optional[List]:
+    """Merge incremental tool_call deltas from OpenAI SSE chunks into complete tool calls."""
+    # Group by tool call index
+    tc_parts: Dict[int, Dict] = {}
+    for obj in data_objects:
+        choices = obj.get("choices", [])
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {})
+        tc_chunks = delta.get("tool_calls", [])
+        if not tc_chunks:
+            continue
+        for chunk in tc_chunks:
+            idx = chunk.get("index", 0)
+            if idx not in tc_parts:
+                tc_parts[idx] = {"id": None, "name": "", "arguments": ""}
+            fn = chunk.get("function", {})
+            if "id" in chunk and chunk["id"] is not None:
+                tc_parts[idx]["id"] = chunk["id"]
+            if "name" in fn and fn["name"] is not None:
+                tc_parts[idx]["name"] = fn["name"]
+            if "arguments" in fn and fn["arguments"] is not None:
+                tc_parts[idx]["arguments"] += fn["arguments"]
+
+    if not tc_parts:
+        return None
+
+    result = []
+    for idx in sorted(tc_parts.keys()):
+        part = tc_parts[idx]
+        if not part["name"]:
+            continue
+        result.append({
+            "id": part["id"] or "call_" + uuid.uuid4().hex[:12],
+            "type": "function",
+            "function": {
+                "name": part["name"],
+                "arguments": part["arguments"] or "{}",
+            },
+        })
+
+    return result if result else None
+
+
+def _extract_anthropic_streaming_tool_calls(data_objects: List[Dict]) -> Optional[List]:
+    """Extract tool_use blocks from Anthropic SSE chunks."""
+    # Anthropic SSE events can be: message_start, content_block_start,
+    # content_block_delta, content_block_stop, message_delta, message_stop
+    # tool_use info is spread across content_block_start (name, id) and
+    # content_block_delta (input_json_delta)
+    tool_inputs: Dict[int, Dict] = {}  # index → {id, name, input_parts}
+    idx_map: Dict[str, int] = {}  # content_block_id → index; next_index counter
+    next_idx = 0
+
+    for obj in data_objects:
+        evt_type = obj.get("type", "")
+
+        if evt_type == "content_block_start":
+            block = obj.get("content_block", {})
+            if block.get("type") == "tool_use":
+                cid = block.get("id", "")
+                idx = next_idx
+                idx_map[cid] = idx
+                next_idx += 1
+                tool_inputs[idx] = {
+                    "id": cid,
+                    "name": block.get("name", "unknown"),
+                    "input_parts": [],
+                }
+
+        elif evt_type == "content_block_delta":
+            delta = obj.get("delta", {})
+            if delta.get("type") == "input_json_delta":
+                # Find which tool this belongs to by index
+                idx = obj.get("index", -1)
+                partial = delta.get("partial_json", "")
+                if idx in tool_inputs and partial:
+                    tool_inputs[idx]["input_parts"].append(partial)
+
+    if not tool_inputs:
+        return None
+
+    result = []
+    for idx in sorted(tool_inputs.keys()):
+        info = tool_inputs[idx]
+        input_str = "".join(info["input_parts"])
+        try:
+            inp = json.loads(input_str)
+        except (json.JSONDecodeError, TypeError):
+            inp = {}
+        result.append({
+            "id": info["id"] or "toolu_" + uuid.uuid4().hex[:12],
+            "type": "function",
+            "function": {
+                "name": info["name"],
+                "arguments": json.dumps(inp, ensure_ascii=False),
+            },
+        })
+
+    return result if result else None
 
 
 def _build_anthropic_response(req: PendingRequest) -> dict:
@@ -379,6 +558,15 @@ async def _forward_request(
             "headers": dict(resp.headers),
             "body": resp_body,
         }
+
+        # Extract tool calls from upstream response
+        if isinstance(resp_body, dict):
+            tool_calls = _extract_tool_calls_from_response(resp_body, req.api_format)
+            if tool_calls:
+                req.response_tool_calls = _enrich_tool_calls_with_descriptions(
+                    tool_calls, req.tools or []
+                )
+
         return req.forwarded_response
     except httpx.TimeoutException:
         logger.warning("FORWARD %s -> TIMEOUT after %ds", req.id, timeout)
@@ -444,6 +632,14 @@ async def _proxy_stream_response(
             }
             if error:
                 req.forwarded_error = error
+
+            # Extract tool calls from accumulated SSE text
+            tool_calls = _extract_tool_calls_from_sse(full_text, req.api_format)
+            if tool_calls:
+                req.response_tool_calls = _enrich_tool_calls_with_descriptions(
+                    tool_calls, req.tools or []
+                )
+
             req.status = "forwarded"
             req.event.set()
             try:
@@ -524,6 +720,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tool-module-header { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: #0f0f23; cursor: pointer; user-select: none; }
   .tool-module-header:hover { background: #141430; }
   .tool-module-header .tool-name { font-weight: 600; color: var(--purple); font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.9rem; }
+  .tool-module-header .tool-desc { font-size: 0.75rem; color: #777; margin-top: 2px; user-select: text; cursor: auto; }
   .tool-module-header .collapse-icon { color: #888; transition: transform 0.2s; font-size: 0.7rem; }
   .tool-module.collapsed .collapse-icon { transform: rotate(-90deg); }
   .tool-module-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
@@ -535,6 +732,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .field-row label { min-width: 100px; font-size: 0.82rem; color: #888; text-align: right; }
   .field-row label.required::after { content: ' *'; color: var(--red); }
   .field-row input, .field-row select, .field-row textarea { flex: 1; padding: 6px 10px; border-radius: 4px; border: 1px solid #444; background: #0a0a18; color: var(--text); font-family: inherit; font-size: 0.85rem; }
+  .extracted-tool { background: var(--input-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+  .extracted-tool-header { padding: 10px 14px; background: #0f0f23; }
+  .extracted-tool-header .tool-name { font-weight: 600; color: var(--purple); font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.9rem; }
+  .extracted-tool-header .tool-desc { font-size: 0.75rem; color: #777; margin-top: 2px; }
+  .extracted-tool-args { padding: 12px 14px; }
   .field-row input:focus, .field-row select:focus, .field-row textarea:focus { outline: none; border-color: var(--blue); }
   .field-row textarea { font-family: 'Fira Code', 'Consolas', monospace; font-size: 0.78rem; min-height: 50px; resize: vertical; }
   .field-row select { cursor: pointer; }
@@ -689,11 +891,18 @@ function handleRequestUpdated(msg) {
     badge.textContent = msg.request.status;
     badge.className = 'badge ' + msg.request.status;
   }
-  // If expanded and now non-pending, hide action buttons
+  // Clear stale detail HTML when status changes — force rebuild on next expand
+  if (msg.request.status !== 'pending') {
+    var detail = document.getElementById('detail-'+msg.request.id);
+    if (detail && msg.request.id !== expandedId) {
+      detail.innerHTML = '';
+    }
+  }
+  // If expanded and now non-pending, rebuild or hide action buttons
   if (msg.request.id === expandedId && msg.request.status !== 'pending') {
     var detail = document.getElementById('detail-'+msg.request.id);
     if (detail) {
-      // For forwarded, rebuild detail to show upstream request/response
+      // For forwarded, rebuild detail to show upstream request/response + tools
       if (msg.request.status === 'forwarded') {
         detail.innerHTML = buildDetailHTML(msg.request);
       } else {
@@ -771,10 +980,14 @@ function buildDetailHTML(r) {
         fieldsHTML = '<div style=\"color:#666;font-size:0.8rem;\">(no parameters defined)</div>';
       }
 
-      toolsHTML += '<div class=\"tool-module'+(wasEnabled?'':' collapsed')+'\" id=\"toolMod-'+r.id+'-'+idx+'\">'
+      var desc = fn.description || '';
+      toolsHTML += '<div class=\"tool-module\" id=\"toolMod-'+r.id+'-'+idx+'\">'
         +'<div class=\"tool-module-header\" onclick=\"event.stopPropagation();document.getElementById(\'toolMod-'+r.id+'-'+idx+'\').classList.toggle(\'collapsed\')\">'
-        +'<span class=\"tool-name\">'+esc(name)+'</span>'
-        +'<span style=\"font-size:0.78rem;color:#666;\">params: '+Object.keys(props).length+'</span>'
+        +'<div style=\"min-width:0;flex:1;\">'
+        +'<div class=\"tool-name\">'+esc(name)+'</div>'
+        +(desc ? '<div class=\"tool-desc\" onclick=\"event.stopPropagation()\">'+esc(desc)+'</div>' : '')
+        +'</div>'
+        +'<span style=\"font-size:0.78rem;color:#666;flex-shrink:0;\">params: '+Object.keys(props).length+'</span>'
         +'<span class=\"collapse-icon\">&#9660;</span></div>'
         +'<div class=\"tool-module-body\">'
         +'<div class=\"tool-enable-row\">'
@@ -825,6 +1038,71 @@ function buildDetailHTML(r) {
     return html;
   }
 
+  function buildExtractedToolsHTML(r) {
+    var toolCalls = r.response_tool_calls;
+    if (!toolCalls || toolCalls.length === 0) return '';
+    var html = '<div class=\"section-title\">Extracted Tool Calls ('+toolCalls.length+' tool'+(toolCalls.length>1?'s':'')+')</div>';
+    toolCalls.forEach(function(tc, idx) {
+      var fn = tc.function || {};
+      var name = fn.name || 'unknown_tool_'+idx;
+      var desc = fn.description || '';
+      var argsStr = fn.arguments || '{}';
+      try {
+        var argsObj = JSON.parse(argsStr);
+        argsStr = JSON.stringify(argsObj, null, 2);
+      } catch(e) {}
+      html += '<div class=\"extracted-tool\">'
+        +'<div class=\"extracted-tool-header\">'
+        +'<div class=\"tool-name\">'+esc(name)+'</div>'
+        +(desc ? '<div class=\"tool-desc\">'+esc(desc)+'</div>' : '')
+        +'</div>'
+        +'<div class=\"extracted-tool-args\">'
+        +'<div class=\"raw-json\">'+esc(argsStr)+'</div>'
+        +'</div></div>';
+    });
+    return html;
+  }
+
+  function buildRequestToolsReadOnly(r) {
+    var tools = r.tools || [];
+    if (tools.length === 0) return '';
+    var html = '<div class=\"section-title\">Request Tools ('+tools.length+' tool'+(tools.length>1?'s':'')+')</div>';
+    tools.forEach(function(tool, idx) {
+      var fn = tool.function || {};
+      var name = fn.name || 'unknown_tool_'+idx;
+      var desc = fn.description || '';
+      var params = fn.parameters || {};
+      var props = params.properties || {};
+      var required = params.required || [];
+      var propNames = Object.keys(props);
+      html += '<div class=\"extracted-tool\">'
+        +'<div class=\"extracted-tool-header\">'
+        +'<div class=\"tool-name\">'+esc(name)+'</div>'
+        +(desc ? '<div class=\"tool-desc\">'+esc(desc)+'</div>' : '')
+        +'</div>'
+        +'<div class=\"extracted-tool-args\">';
+      if (propNames.length === 0) {
+        html += '<div style=\"color:#666;font-size:0.82rem;\">(no parameters)</div>';
+      } else {
+        html += '<div style=\"font-size:0.8rem;color:#888;margin-bottom:6px;\">Parameters:</div>';
+        propNames.forEach(function(propName) {
+          var prop = props[propName] || {};
+          var isReq = required.indexOf(propName) >= 0;
+          var typeStr = prop.type || 'string';
+          if (prop.enum) typeStr = 'enum: '+prop.enum.join('|');
+          html += '<div style=\"font-size:0.82rem;padding:2px 0;\">'
+            +'<span style=\"color:#ccc;\">'+esc(propName)+'</span>'
+            +(isReq?' <span style=\"color:var(--red);font-size:0.7rem;\">*required</span>':'')
+            +' <span style=\"color:#666;\">('+esc(typeStr)+')</span>'
+            +(prop.description ? ' <span style=\"color:#888;\">— '+esc(prop.description)+'</span>' : '')
+            +'</div>';
+        });
+      }
+      html += '</div></div>';
+    });
+    return html;
+  }
+
   var buttonsHTML = '';
   if (r.status === 'pending') {
     buttonsHTML = '<div class=\"btn-row\">'
@@ -844,6 +1122,8 @@ function buildDetailHTML(r) {
 
   if (r.status === 'forwarded') {
     detailHTML += buildForwardedHTML(r);
+    detailHTML += buildExtractedToolsHTML(r);
+    detailHTML += buildRequestToolsReadOnly(r);
     detailHTML += buttonsHTML;
   } else {
     detailHTML += '<div class=\"section-title\">Response Text</div>'
@@ -996,7 +1276,6 @@ class MockLLMServer:
         self._scripts = _load_scripts(scripts_path)
         self._forward_config = _load_forward_config(forward_config_path)
         self._http_client = httpx.AsyncClient(timeout=30.0) if self._forward_config else None
-        self._server_thread: Optional[threading.Thread] = None
         self._ws_clients: set = set()
         self._app = self._create_app()
 
@@ -1016,27 +1295,9 @@ class MockLLMServer:
         print()
         uvicorn.run(self._app, host=self.host, port=self.port, log_level="info")
 
-    def start_in_thread(self) -> threading.Thread:
-        """Start the server in a background thread. Returns the thread."""
-        def _run():
-            uvicorn.run(self._app, host=self.host, port=self.port, log_level="info")
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        self._server_thread = t
-        time.sleep(0.5)  # brief wait for startup
-        return t
-
-    def stop(self):
-        """Signal shutdown (uvicorn runs in daemon thread, will exit with process)."""
-        pass
-
     def pending_count(self) -> int:
         with self._lock:
             return sum(1 for r in self._pending.values() if r.status == "pending")
-
-    def get_pending_requests(self) -> List[PendingRequest]:
-        with self._lock:
-            return [r for r in self._pending.values() if r.status == "pending"]
 
     def _serialize(self, req: PendingRequest) -> dict:
         return {

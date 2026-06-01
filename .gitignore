@@ -1,2 +1,9 @@
-agent_llm_mock/__pycache__/*
-agent_llm_mock.egg-info/*
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+*.log
