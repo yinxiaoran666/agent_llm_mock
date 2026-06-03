@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 import sys
 import time
 import uuid
@@ -396,6 +397,23 @@ def _anthropic_stream_response(req: PendingRequest):
 # Scripted responses
 # ---------------------------------------------------------------------------
 
+def _redact_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Redact sensitive header values (PII) before storage."""
+    SENSITIVE = {"authorization", "x-api-key", "cookie", "x-custom"}
+    result = {}
+    for k, v in headers.items():
+        if k.lower() in SENSITIVE:
+            # Keep prefix visible, mask the rest
+            if v:
+                prefix = v[:15] if len(v) > 15 else v[:4]
+                result[k] = f"{prefix}****"
+            else:
+                result[k] = v
+        else:
+            result[k] = v
+    return result
+
+
 def _load_scripts(path: Optional[str]) -> List[Dict]:
     if not path:
         return []
@@ -642,6 +660,10 @@ async def _proxy_stream_response(
 
             req.status = "forwarded"
             req.event.set()
+            try:
+                req._save_callback()
+            except Exception:
+                pass
             try:
                 await req._broadcast_callback({
                     "type": "request_updated",
@@ -1268,7 +1290,8 @@ class MockLLMServer:
     """Local LLM mock server with OpenAI and Anthropic endpoints + web dashboard."""
 
     def __init__(self, port: int = 9999, host: str = "0.0.0.0",
-                 scripts_path: str = None, forward_config_path: str = None):
+                 scripts_path: str = None, forward_config_path: str = None,
+                 db_path: str = "agent-llm-mock.db"):
         self.port = port
         self.host = host
         self._pending: Dict[str, PendingRequest] = {}
@@ -1277,7 +1300,75 @@ class MockLLMServer:
         self._forward_config = _load_forward_config(forward_config_path)
         self._http_client = httpx.AsyncClient(timeout=30.0) if self._forward_config else None
         self._ws_clients: set = set()
+        self._db_path = db_path
+        self._init_db()
         self._app = self._create_app()
+
+    # ---- database ----
+
+    def _init_db(self):
+        """Create SQLite database and requests table."""
+        self._db = sqlite3.connect(self._db_path, check_same_thread=False)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS requests (
+                id TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                api_format TEXT NOT NULL DEFAULT 'openai',
+                mode TEXT NOT NULL,
+                model TEXT,
+                stream INTEGER DEFAULT 0,
+                status TEXT NOT NULL,
+                duration_ms REAL,
+                request_body TEXT,
+                request_headers TEXT,
+                tools_json TEXT,
+                messages_json TEXT,
+                response_content TEXT,
+                response_tool_calls TEXT,
+                forwarded_url TEXT,
+                forwarded_request TEXT,
+                forwarded_response TEXT,
+                error_message TEXT
+            )
+        """)
+        self._db.commit()
+
+    def _save_request(self, req: PendingRequest, mode: str):
+        """Persist a finalized request to SQLite."""
+        duration_ms = (time.time() - req.created_at) * 1000
+        try:
+            self._db.execute(
+                """INSERT OR REPLACE INTO requests
+                   (id, created_at, api_format, mode, model, stream, status,
+                    duration_ms, request_body, request_headers, tools_json,
+                    messages_json, response_content, response_tool_calls,
+                    forwarded_url, forwarded_request, forwarded_response,
+                    error_message)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    req.id,
+                    req.created_at,
+                    req.api_format,
+                    mode,
+                    req.model,
+                    1 if req.stream else 0,
+                    req.status,
+                    duration_ms,
+                    json.dumps(req.raw_request_body, ensure_ascii=False) if req.raw_request_body else None,
+                    json.dumps(req.raw_request_headers, ensure_ascii=False) if req.raw_request_headers else None,
+                    json.dumps(req.tools, ensure_ascii=False) if req.tools else None,
+                    json.dumps(req.messages, ensure_ascii=False) if req.messages else None,
+                    req.response_content,
+                    json.dumps(req.response_tool_calls, ensure_ascii=False) if req.response_tool_calls else None,
+                    req.forwarded_request.get("url") if req.forwarded_request else None,
+                    json.dumps(req.forwarded_request, ensure_ascii=False) if req.forwarded_request else None,
+                    json.dumps(req.forwarded_response, ensure_ascii=False) if req.forwarded_response else None,
+                    req.forwarded_error,
+                ),
+            )
+            self._db.commit()
+        except Exception:
+            logger.exception("DB save failed for %s", req.id)
 
     # ---- public API ----
 
@@ -1381,7 +1472,7 @@ class MockLLMServer:
                 response_format=body.get("response_format"),
                 extra_body=extra,
                 raw_request_body=body,
-                raw_request_headers=request_headers,
+                raw_request_headers=_redact_headers(request_headers),
             )
 
             # Check scripted responses
@@ -1390,6 +1481,7 @@ class MockLLMServer:
                 req.response_content = script_match.get("content", "")
                 req.response_tool_calls = script_match.get("tool_calls")
                 req.status = "completed"
+                self._save_request(req, "script")
                 req.event.set()
                 with self._lock:
                     self._pending[req_id] = req
@@ -1431,11 +1523,13 @@ class MockLLMServer:
                     req._broadcast_callback = self._broadcast
                     req._serialize_callback = self._serialize
                     req._stats_callback = self._stats
+                    req._save_callback = lambda: self._save_request(req, "forward")
                     return await _proxy_stream_response(req, forward_rule, self._http_client, request_headers)
 
                 upstream_resp = await _forward_request(req, forward_rule, self._http_client, request_headers)
                 if upstream_resp:
                     req.status = "forwarded"
+                    self._save_request(req, "forward")
                     req.event.set()
                     with self._lock:
                         self._pending[req_id] = req
@@ -1476,6 +1570,7 @@ class MockLLMServer:
             if not signalled:
                 req.status = "skipped"
                 req.response_content = "[timeout — no response from operator]"
+                self._save_request(req, "manual")
                 logger.warning("REQ %s -> TIMEOUT (3600s)", req_id)
             else:
                 logger.info(
@@ -1543,7 +1638,7 @@ class MockLLMServer:
                 api_format="anthropic",
                 system_prompt=system if isinstance(system, str) else (json.dumps(system, ensure_ascii=False) if system else None),
                 raw_request_body=body,
-                raw_request_headers=request_headers,
+                raw_request_headers=_redact_headers(request_headers),
             )
 
             # Check scripted responses
@@ -1552,6 +1647,7 @@ class MockLLMServer:
                 req.response_content = script_match.get("content", "")
                 req.response_tool_calls = script_match.get("tool_calls")
                 req.status = "completed"
+                self._save_request(req, "script")
                 req.event.set()
                 with self._lock:
                     self._pending[req_id] = req
@@ -1593,11 +1689,13 @@ class MockLLMServer:
                     req._broadcast_callback = self._broadcast
                     req._serialize_callback = self._serialize
                     req._stats_callback = self._stats
+                    req._save_callback = lambda: self._save_request(req, "forward")
                     return await _proxy_stream_response(req, forward_rule, self._http_client, request_headers)
 
                 upstream_resp = await _forward_request(req, forward_rule, self._http_client, request_headers)
                 if upstream_resp:
                     req.status = "forwarded"
+                    self._save_request(req, "forward")
                     req.event.set()
                     with self._lock:
                         self._pending[req_id] = req
@@ -1636,6 +1734,7 @@ class MockLLMServer:
             if not signalled:
                 req.status = "skipped"
                 req.response_content = "[timeout — no response from operator]"
+                self._save_request(req, "manual")
                 logger.warning("REQ %s -> TIMEOUT (3600s)", req_id)
             else:
                 logger.info(
@@ -1686,6 +1785,7 @@ class MockLLMServer:
             req.response_content = body.get("content", "")
             req.response_tool_calls = body.get("tool_calls")
             req.status = "completed"
+            self._save_request(req, "manual")
             req.event.set()
             logger.info(
                 "RESPOND %s -> COMPLETED content=%d chars, tool_calls=%d",
@@ -1713,6 +1813,7 @@ class MockLLMServer:
                 raise HTTPException(409, "Request already handled")
             req.response_content = ""
             req.status = "skipped"
+            self._save_request(req, "manual")
             req.event.set()
             logger.info("SKIP %s -> SKIPPED", req_id)
             await self._broadcast({
@@ -1733,6 +1834,43 @@ class MockLLMServer:
                 "skipped": sum(1 for r in items if r.status == "skipped"),
                 "total": len(items),
             }
+
+        @app.get("/api/history")
+        async def history(limit: int = 100, offset: int = 0):
+            """List persisted requests from SQLite."""
+            rows = self._db.execute(
+                "SELECT id, created_at, api_format, mode, model, stream, status, "
+                "duration_ms, response_content, "
+                "length(request_body) as req_body_len, "
+                "length(forwarded_response) as fwd_resp_len, "
+                "error_message "
+                "FROM requests ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            return [
+                {
+                    "id": r[0], "created_at": r[1], "api_format": r[2],
+                    "mode": r[3], "model": r[4], "stream": bool(r[5]),
+                    "status": r[6], "duration_ms": r[7],
+                    "response_content": r[8],
+                    "request_body_len": r[9], "forwarded_response_len": r[10],
+                    "error_message": r[11],
+                }
+                for r in rows
+            ]
+
+        @app.get("/api/history/{req_id}")
+        async def history_detail(req_id: str):
+            """Get full detail for a single persisted request."""
+            row = self._db.execute(
+                "SELECT * FROM requests WHERE id = ?", (req_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "Request not found in history")
+            cols = [c[0] for c in self._db.execute(
+                "SELECT name FROM pragma_table_info('requests')"
+            ).fetchall()]
+            return dict(zip(cols, row))
 
         @app.websocket("/ws")
         async def ws_endpoint(websocket: WebSocket):
